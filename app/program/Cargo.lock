@@ -398,6 +398,8 @@ version = "0.1.0"
 dependencies = [
  "arch_program",
  "borsh",
+ "hex",
+ "sha2",
 ]
 
 [[package]]
