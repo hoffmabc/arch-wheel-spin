@@ -76,78 +76,118 @@ function App() {
     try {
       setWheelState(prev => ({ ...prev, isSpinning: true }))
       
-      // Sign the spin transaction
-      const message = 'Spin the wheel!'
-      let final_signature = null
-      const signature = await signMessage({
+      // Generate user secret and commitment
+      const userSecret = crypto.getRandomValues(new Uint8Array(32))
+      const commitment = await crypto.subtle.digest('SHA-256', userSecret)
+      
+      // First transaction: commit
+      let commitSignature = null
+      await signMessage({
         payload: {
-          message,
+          message: 'Commit to wheel spin',
           address: walletAddress,
           network: {
             type: 'Testnet'
           }
         },
         onFinish: (response) => {
-          console.log('Signature:', response)
-          if (!response) {
-            throw new Error('No signature returned')
-          }
-          // Convert base64 to Uint8Array
-          final_signature = Uint8Array.from(Buffer.from(response, 'base64'))
+          if (!response) throw new Error('No signature returned')
+          commitSignature = Uint8Array.from(Buffer.from(response, 'base64'))
         },
         onCancel: () => {
           throw new Error('User cancelled signing')
         }
       })
-
-      if (!final_signature) {
-        throw new Error('No signature returned from wallet')
+  
+      if (!commitSignature) {
+        throw new Error('No commit signature returned from wallet')
       }
   
-      // Create the instruction
-      const instruction = {
+      // Create commit instruction
+      const commitInstruction = {
         program_id: PubkeyUtil.fromHex(import.meta.env.VITE_PROGRAM_ID),
         accounts: [
           {
             pubkey: PubkeyUtil.fromHex(publicKey),
             is_signer: true,
-            is_writable: false
+            is_writable: true
           }
         ],
-        data: new Uint8Array([1]) // 1 represents SpinWheel instruction
+        data: Buffer.concat([
+          new Uint8Array([1]), // CommitSpin instruction
+          new Uint8Array(commitment)
+        ])
       }
   
-      // Create the transaction
-      const transaction = {
+      // Send commit transaction
+      const commitTx = {
         version: 0,
-        signatures: [final_signature],
+        signatures: [commitSignature],
         message: {
           signers: [PubkeyUtil.fromHex(publicKey)],
-          instructions: [instruction]
+          instructions: [commitInstruction]
         }
       }
   
-      console.log('Transaction details:', {
-        version: transaction.version,
-        signatures: transaction.signatures.map(sig => Buffer.from(sig).toString('hex')),
-        message: {
-          signers: transaction.message.signers.map(signer => Buffer.from(signer).toString('hex')),
-          instructions: transaction.message.instructions.map(inst => ({
-            program_id: Buffer.from(inst.program_id).toString('hex'),
-            accounts: inst.accounts.map(acc => ({
-              pubkey: Buffer.from(acc.pubkey).toString('hex'),
-              is_signer: acc.is_signer,
-              is_writable: acc.is_writable
-            })),
-            data: Buffer.from(inst.data).toString('hex')
-          }))
+      const commitTxId = await sdk.sendTransaction(commitTx)
+      console.log('Commit transaction sent:', commitTxId)
+  
+      // Wait for confirmation
+      await new Promise(resolve => setTimeout(resolve, 2000))
+  
+      // Second transaction: reveal
+      let revealSignature = null
+      await signMessage({
+        payload: {
+          message: 'Reveal wheel spin',
+          address: walletAddress,
+          network: {
+            type: 'Testnet'
+          }
+        },
+        onFinish: (response) => {
+          if (!response) throw new Error('No signature returned')
+          revealSignature = Uint8Array.from(Buffer.from(response, 'base64'))
+        },
+        onCancel: () => {
+          throw new Error('User cancelled signing')
         }
       })
   
-      // Send the transaction
-      const txid = await sdk.sendTransaction(transaction)
-      console.log('Transaction sent:', txid)
+      if (!revealSignature) {
+        throw new Error('No reveal signature returned from wallet')
+      }
   
+      // Create reveal instruction
+      const revealInstruction = {
+        program_id: PubkeyUtil.fromHex(import.meta.env.VITE_PROGRAM_ID),
+        accounts: [
+          {
+            pubkey: PubkeyUtil.fromHex(publicKey),
+            is_signer: true,
+            is_writable: true
+          }
+        ],
+        data: Buffer.concat([
+          new Uint8Array([2]), // RevealSpin instruction
+          userSecret
+        ])
+      }
+  
+      // Send reveal transaction
+      const revealTx = {
+        version: 0,
+        signatures: [revealSignature],
+        message: {
+          signers: [PubkeyUtil.fromHex(publicKey)],
+          instructions: [revealInstruction]
+        }
+      }
+  
+      const revealTxId = await sdk.sendTransaction(revealTx)
+      console.log('Reveal transaction sent:', revealTxId)
+  
+      // For now, we'll use a random number until we implement getting the result from the chain
       const prizeNumber = Math.floor(Math.random() * wheelData.length)
       setWheelState(prev => ({
         ...prev,

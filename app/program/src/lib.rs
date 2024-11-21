@@ -6,20 +6,23 @@ use arch_program::{
     program::next_account_info,
     program_error::ProgramError,
     pubkey::Pubkey,
+    hash::{hash, Hash},
 };
 use borsh::{BorshDeserialize, BorshSerialize};
-use arch_program::utxo::UtxoMeta;
+
 
 #[derive(BorshSerialize, BorshDeserialize, Debug)]
 pub enum WheelInstruction {
-    // Initialize the wheel with prizes
     InitializeWheel {
         prizes: Vec<String>,
-        probabilities: Vec<u8>, // Probabilities for each prize (must sum to 100)
+        probabilities: Vec<u8>,
     },
-    // Spin the wheel
-    SpinWheel,
-    // Claim a prize
+    CommitSpin {
+        commitment: [u8; 32], // Hash of user's secret value
+    },
+    RevealSpin {
+        user_secret: [u8; 32], // Original secret value
+    },
     ClaimPrize,
 }
 
@@ -29,9 +32,13 @@ pub struct WheelState {
     pub initialized: bool,
     pub prizes: Vec<String>,
     pub probabilities: Vec<u8>,
-    pub last_spin_result: Option<usize>, // Index of the last prize won
+    pub last_spin_result: Option<usize>,
     pub total_spins: u64,
     pub authority: Pubkey,
+    // Store verification data
+    pub last_slot: u64,
+    pub last_block_hash: [u8; 32],
+    pub user_commitment: [u8; 32],
 }
 
 entrypoint!(process_instruction);
@@ -105,6 +112,139 @@ fn map_to_program_error(error: std::io::Error) -> ProgramError {
 fn process_spin(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
+    user_entropy: [u8; 32],
+) -> Result<(), ProgramError> {
+    let account_info_iter = &mut accounts.iter();
+    let wheel_account = next_account_info(account_info_iter)?;
+    let player = next_account_info(account_info_iter)?;
+    let recent_blockhash_account = next_account_info(account_info_iter)?;
+
+    if !player.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let mut wheel_state = WheelState::try_from_slice(&wheel_account.try_borrow_data()?)?;
+    
+    if !wheel_state.initialized {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    // Get current block hash
+    let current_blockhash: [u8; 32] = recent_blockhash_account
+        .try_borrow_data()?
+        .try_into()
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let (random_value, final_hash) = get_verifiable_random_value(
+        &current_blockhash,
+        &user_entropy,
+        timestamp,
+        &wheel_state.probabilities
+    );
+
+    // Store all randomness components for verification
+    wheel_state.last_block_hash = current_blockhash;
+    wheel_state.user_entropy = user_entropy;
+    wheel_state.spin_timestamp = timestamp;
+    wheel_state.last_spin_result = Some(random_value);
+    wheel_state.total_spins += 1;
+
+    wheel_state.serialize(&mut *wheel_account.try_borrow_mut_data()?)?;
+    
+    msg!("Wheel spin result: {}", wheel_state.prizes[random_value]);
+    msg!("Verification hash: {}", hex::encode(final_hash));
+    
+    Ok(())
+}
+
+fn get_verifiable_random_value(
+    slot: u64,
+    block_hash: &[u8; 32],
+    user_secret: &[u8; 32],
+    probabilities: &[u8]
+) -> (usize, [u8; 32]) {
+    // Combine inputs deterministically
+    let mut combined = [0u8; 32 + 32 + 8];
+    combined[0..32].copy_from_slice(block_hash);
+    combined[32..64].copy_from_slice(user_secret);
+    combined[64..].copy_from_slice(&slot.to_le_bytes());
+    
+    // Hash the combined value
+    let hash_result = hash(&combined).to_bytes();
+    
+    // Use first 8 bytes for the random number
+    let random_bytes: [u8; 8] = hash_result[0..8].try_into().unwrap();
+    let random_number = u64::from_le_bytes(random_bytes) % 100;
+    
+    // Select prize using weighted probabilities
+    let mut cumulative = 0;
+    for (index, &probability) in probabilities.iter().enumerate() {
+        cumulative += probability;
+        if random_number < cumulative as u64 {
+            return (index, hash_result);
+        }
+    }
+    
+    (probabilities.len() - 1, hash_result)
+}
+
+fn process_reveal_spin(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    user_secret: [u8; 32],
+) -> Result<(), ProgramError> {
+    let account_info_iter = &mut accounts.iter();
+    let wheel_account = next_account_info(account_info_iter)?;
+    let player = next_account_info(account_info_iter)?;
+    let slot_history = next_account_info(account_info_iter)?;
+    let recent_blockhashes = next_account_info(account_info_iter)?;
+
+    if !player.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let mut wheel_state = WheelState::try_from_slice(&wheel_account.try_borrow_data()?)?;
+    
+    // Verify the commitment matches
+    let commitment = hash(&user_secret).to_bytes();
+    if commitment != wheel_state.user_commitment {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Get current slot and blockhash
+    let slot = arch_program::clock::Clock::get()?.slot;
+    let blockhash = recent_blockhashes.try_borrow_data()?[0..32].try_into().unwrap();
+
+    let (random_value, final_hash) = get_verifiable_random_value(
+        slot,
+        &blockhash,
+        &user_secret,
+        &wheel_state.probabilities
+    );
+
+    // Store verification data
+    wheel_state.last_slot = slot;
+    wheel_state.last_block_hash = blockhash;
+    wheel_state.last_spin_result = Some(random_value);
+    wheel_state.total_spins += 1;
+
+    wheel_state.serialize(&mut *wheel_account.try_borrow_mut_data()?)?;
+    
+    msg!("Wheel spin result: {}", wheel_state.prizes[random_value]);
+    msg!("Verification hash: {:?}", final_hash);
+    
+    Ok(())
+}
+
+fn process_commit_spin(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    commitment: [u8; 32],
 ) -> Result<(), ProgramError> {
     let account_info_iter = &mut accounts.iter();
     let wheel_account = next_account_info(account_info_iter)?;
@@ -114,43 +254,11 @@ fn process_spin(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    let mut wheel_state = WheelState::try_from_slice(&wheel_account.try_borrow_data()?).map_err(map_to_program_error)?;
+    let mut wheel_state = WheelState::try_from_slice(&wheel_account.try_borrow_data()?)?;
+    wheel_state.user_commitment = commitment;
+    wheel_state.serialize(&mut *wheel_account.try_borrow_mut_data()?)?;
     
-    if !wheel_state.initialized {
-        return Err(ProgramError::UninitializedAccount);
-    }
-
-    // Generate random result based on probabilities
-    let random_value = get_random_value(&wheel_state.probabilities);
-    wheel_state.last_spin_result = Some(random_value);
-    wheel_state.total_spins += 1;
-
-    wheel_state.serialize(&mut *wheel_account.try_borrow_mut_data()?).map_err(map_to_program_error)?;
-    
-    msg!("Wheel spin result: {}", wheel_state.prizes[random_value]);
     Ok(())
-}
-
-// Helper function to get random value based on probabilities
-fn get_random_value(probabilities: &[u8]) -> usize {
-    // In a real implementation, you would want to use a more secure source of randomness
-    // This is just a simple example
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    
-    let random_number = timestamp % 100;
-    let mut cumulative = 0;
-    
-    for (index, &probability) in probabilities.iter().enumerate() {
-        cumulative += probability;
-        if random_number < cumulative as u64 {
-            return index;
-        }
-    }
-    
-    probabilities.len() - 1
 }
 
 fn process_claim_prize(
