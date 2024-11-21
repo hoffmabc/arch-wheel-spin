@@ -34,49 +34,61 @@ pub struct WheelState {
     pub last_slot: u64,
     pub last_block_hash: [u8; 32],
     pub user_commitment: [u8; 32],
+    pub commit_slot: u64,  // Slot when commitment was made
+    pub min_reveal_slot: u64,  // Minimum slot for reveal
+    pub max_reveal_slot: u64,  // Maximum slot for reveal
 }
 
 fn get_verifiable_random_value(
     block_hash: &[u8],
     user_secret: &[u8],
     slot: u64,
+    last_block_hash: &[u8],
     probabilities: &[u8]
 ) -> (usize, [u8; 32]) {
-    // Combine inputs in a deterministic way
     let mut result = [0u8; 32];
+    let mut temp = [0u8; 32];
     
-    // Mix block hash and user secret
+    // Mix previous block hash with current
     for i in 0..32 {
-        result[i] = block_hash[i].wrapping_add(user_secret[i]);
+        temp[i] = block_hash[i].wrapping_add(last_block_hash[i]);
     }
     
-    // Mix in slot number using wrapping operations to avoid overflow
-    let slot_bytes = slot.to_le_bytes();
-    for i in 0..8 {
-        result[i] = result[i].wrapping_add(slot_bytes[i]);
-        // Additional mixing for better distribution
-        result[i + 8] = result[i].wrapping_mul(slot_bytes[i]);
-        result[i + 16] = result[i].wrapping_add(result[i + 8]);
-        result[i + 24] = result[i + 16].wrapping_mul(slot_bytes[i]);
+    // Multiple mixing rounds
+    for round in 0..8 {
+        // Mix user secret
+        for i in 0..32 {
+            result[i] = temp[i]
+                .wrapping_add(user_secret[i])
+                .wrapping_mul(0x2d); // Prime
+            result[i] = result[i].rotate_left(round + 1);
+        }
+        
+        // Mix slot with varying shifts
+        let slot_bytes = slot.to_le_bytes();
+        for i in 0..8 {
+            let idx = (i * 4) % 32;
+            result[idx] = result[idx]
+                .wrapping_add(slot_bytes[i])
+                .rotate_right(round + 2);
+        }
     }
     
-    // Convert to random number avoiding modulo bias
-    let mut random_bytes = [0u8; 8];
-    random_bytes.copy_from_slice(&result[0..8]);
-    let random_value = u64::from_le_bytes(random_bytes);
+    // Unbiased random number generation
+    let mut final_number = 0u64;
+    let max_safe = u64::MAX - (u64::MAX % 100);
     
-    // Reduce bias by rejecting values above threshold
-    let max_value = u64::MAX - (u64::MAX % 100);
-    let final_number = if random_value >= max_value {
-        // If biased, use next 8 bytes
-        let mut alt_bytes = [0u8; 8];
-        alt_bytes.copy_from_slice(&result[8..16]);
-        u64::from_le_bytes(alt_bytes) % 100
-    } else {
-        random_value % 100
-    };
+    for i in 0..4 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&result[i*8..(i+1)*8]);
+        let value = u64::from_le_bytes(bytes);
+        if value < max_safe {
+            final_number = value % 100;
+            break;
+        }
+    }
     
-    // Select prize using weighted probabilities
+    // Select prize
     let mut cumulative = 0;
     for (index, &probability) in probabilities.iter().enumerate() {
         cumulative += probability;
@@ -90,24 +102,24 @@ fn get_verifiable_random_value(
 
 fn create_commitment(user_secret: &[u8; 32]) -> [u8; 32] {
     let mut commitment = [0u8; 32];
+    let mut temp = [0u8; 32];
     
-    // Create commitment using multiple mixing rounds
-    for i in 0..32 {
-        commitment[i] = user_secret[i];
-    }
-    
-    // Additional mixing rounds
-    for round in 0..4 {
-        for i in 0..31 {
-            commitment[i] = commitment[i]
-                .wrapping_add(commitment[i + 1])
-                .wrapping_mul(0x7f); // Prime multiplier for better distribution
+    // Multiple rounds of mixing with different operations per round
+    for round in 0..16 {
+        for i in 0..32 {
+            temp[i] = user_secret[i].wrapping_mul(0xf5); // Prime multiplier
+            temp[i] = temp[i].wrapping_add(round as u8);
+            temp[i] = temp[i].rotate_left(3); // Bit rotation
         }
-        commitment[31] = commitment[31]
-            .wrapping_add(commitment[0])
-            .wrapping_mul(0x7f);
+        
+        // Mix with previous round
+        for i in 0..32 {
+            commitment[i] = commitment[i]
+                .wrapping_add(temp[i])
+                .wrapping_mul(0x1d); // Different prime
+            commitment[i] = commitment[i].rotate_right(2);
+        }
     }
-    
     commitment
 }
 
@@ -173,6 +185,9 @@ fn process_initialize(
         last_slot: 0,
         last_block_hash: [0; 32],
         user_commitment: [0; 32],
+        commit_slot: 0,
+        min_reveal_slot: 0,
+        max_reveal_slot: 0,
     };
 
     wheel_state.serialize(&mut *wheel_account.try_borrow_mut_data()?)
@@ -218,6 +233,8 @@ fn process_reveal_spin(
 
     let mut wheel_state = WheelState::try_from_slice(&wheel_account.try_borrow_data()?)
         .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    
     
     // Verify commitment
     let commitment = create_commitment(&user_secret);
@@ -247,10 +264,24 @@ fn process_reveal_spin(
     let mut blockhash = [0u8; 32];
     blockhash.copy_from_slice(&blockhash_data[0..32]);
 
+    // Verify timing constraints
+    if slot < wheel_state.min_reveal_slot {
+        return Err(ProgramError::InvalidArgument); // Too early
+    }
+    if slot > wheel_state.max_reveal_slot {
+        return Err(ProgramError::InvalidArgument); // Too late
+    }
+    
+    // Verify block hash freshness
+    if wheel_state.last_block_hash == blockhash {
+        return Err(ProgramError::InvalidArgument); // Prevent replay
+    }
+
     let (random_value, final_hash) = get_verifiable_random_value(
         &blockhash,
         &user_secret,
         slot,
+        &wheel_state.last_block_hash,
         &wheel_state.probabilities
     );
 
