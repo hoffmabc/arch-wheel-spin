@@ -190,6 +190,14 @@ fn process_initialize(
         max_reveal_slot: 0,
     };
 
+    let serialized_data = borsh::to_vec(&wheel_state)
+        .map_err(|_| ProgramError::AccountDataTooSmall)?;
+
+    let required_len = serialized_data.len();
+    if wheel_account.data_len() < required_len {
+        wheel_account.realloc(required_len, false)?;
+    }
+
     wheel_state.serialize(&mut *wheel_account.try_borrow_mut_data()?)
         .map_err(|_| ProgramError::InvalidAccountData)
 }
