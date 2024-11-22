@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { RpcConnection, ArchConnection, PubkeyUtil } from '@saturnbtcio/arch-sdk'
+import { RpcConnection, ArchConnection, PubkeyUtil, MessageUtil } from '@saturnbtcio/arch-sdk'
 import { getAddress, signMessage } from 'sats-connect'
 import { Buffer } from 'buffer'
 import { Wheel } from 'react-custom-roulette'
@@ -9,9 +9,9 @@ window.Buffer = Buffer
 
 function App() {
   const wheelData = [
-    { option: 'Prize 1', style: { backgroundColor: '#ff8f43', textColor: 'white' } },
-    { option: 'Prize 2', style: { backgroundColor: '#70bbe0', textColor: 'white' } },
-    { option: 'Prize 3', style: { backgroundColor: '#ff5252', textColor: 'white' } }
+    { option: 'Pub #123 ', style: { backgroundColor: '#ff8f43', textColor: 'white' } },
+    { option: 'Loser', style: { backgroundColor: '#70bbe0', textColor: 'white' } },
+    { option: 'Loser', style: { backgroundColor: '#ff5252', textColor: 'white' } }
   ]
 
   const [wheelState, setWheelState] = useState({
@@ -25,24 +25,46 @@ function App() {
 
   // Initialize Arch SDK with proper provider
   useEffect(() => {
-    const initSDK = async () => {
-      const rpcUrl = import.meta.env.VITE_RPC_URL || '/api'
-      console.log('Connecting to RPC URL:', rpcUrl)
-      
+    const testRpcEndpoint = async () => {
       try {
-        // Create RPC provider
-        const provider = new RpcConnection(rpcUrl)
+        const response = await fetch('/api', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'is_node_ready'
+          })
+        });
         
-        // Initialize Arch with the provider
-        const archSdk = ArchConnection(provider)
-        setSdk(archSdk)
-        console.log('Successfully connected to RPC')
+        const data = await response.json();
+        console.log('Test RPC response:', data);
+        
+        // If test succeeds, initialize SDK
+        if (data.result === true) {
+          initSDK();
+        }
       } catch (err) {
-        console.error('Failed to initialize SDK:', err)
+        console.error('RPC test failed:', err);
       }
-    }
-    initSDK()
-  }, [])
+    };
+
+    const initSDK = async () => {
+      const rpcUrl = '/api';
+      try {
+        const provider = new RpcConnection(rpcUrl);
+        const archSdk = ArchConnection(provider);
+        setSdk(archSdk);
+      } catch (err) {
+        console.error('SDK init failed:', err);
+      }
+    };
+
+    testRpcEndpoint();
+  }, []);
 
   // Connect wallet function
   const connectWallet = async () => {
@@ -80,11 +102,33 @@ function App() {
       const userSecret = crypto.getRandomValues(new Uint8Array(32))
       const commitment = await crypto.subtle.digest('SHA-256', userSecret)
       
-      // First transaction: commit
-      let commitSignature = null
+      // Create commit instruction data
+      const commitInstruction = {
+        program_id: PubkeyUtil.fromHex(import.meta.env.VITE_PROGRAM_ID),
+        accounts: [
+          {
+            pubkey: PubkeyUtil.fromHex(publicKey),
+            is_signer: true,
+            is_writable: false
+          }
+        ],
+        data: Buffer.concat([
+          new Uint8Array([1]), // CommitSpin instruction
+          new Uint8Array(commitment)
+        ])
+      };
+      
+      const messageObj = {
+        signers: [PubkeyUtil.fromHex(publicKey)],
+        instructions: [commitInstruction]
+      };
+      
+      // Hash and sign the complete message
+      const messageHash = MessageUtil.hash(messageObj);
+      let commitSignature = null;
       await signMessage({
         payload: {
-          message: 'Commit to wheel spin',
+          message: Buffer.from(messageHash).toString('hex'),
           address: walletAddress,
           network: {
             type: 'Testnet'
@@ -92,44 +136,22 @@ function App() {
         },
         onFinish: (response) => {
           if (!response) throw new Error('No signature returned')
-          commitSignature = Uint8Array.from(Buffer.from(response, 'base64'))
+          // Take last 64 bytes of signature
+          commitSignature = new Uint8Array(Buffer.from(response, 'base64')).slice(2)
         },
         onCancel: () => {
           throw new Error('User cancelled signing')
         }
-      })
-  
-      if (!commitSignature) {
-        throw new Error('No commit signature returned from wallet')
-      }
-  
-      // Create commit instruction
-      const commitInstruction = {
-        program_id: PubkeyUtil.fromHex(import.meta.env.VITE_PROGRAM_ID),
-        accounts: [
-          {
-            pubkey: PubkeyUtil.fromHex(publicKey),
-            is_signer: true,
-            is_writable: true
-          }
-        ],
-        data: Buffer.concat([
-          new Uint8Array([1]), // CommitSpin instruction
-          new Uint8Array(commitment)
-        ])
-      }
-  
-      // Send commit transaction
+      });
+      
+      // Send transaction
       const commitTx = {
         version: 0,
         signatures: [commitSignature],
-        message: {
-          signers: [PubkeyUtil.fromHex(publicKey)],
-          instructions: [commitInstruction]
-        }
-      }
-  
-      const commitTxId = await sdk.sendTransaction(commitTx)
+        message: messageObj
+      };
+      
+      const commitTxId = await sdk.sendTransaction(commitTx);
       console.log('Commit transaction sent:', commitTxId)
   
       // Wait for confirmation
@@ -165,7 +187,7 @@ function App() {
           {
             pubkey: PubkeyUtil.fromHex(publicKey),
             is_signer: true,
-            is_writable: true
+            is_writable: false
           }
         ],
         data: Buffer.concat([
