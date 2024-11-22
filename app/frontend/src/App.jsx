@@ -26,6 +26,7 @@ function App() {
   const [sdk, setSdk] = useState(null)
   const [isAdmin, setIsAdmin] = useState(false)
   const [isInitialized, setIsInitialized] = useState(false)
+  const [wheelSound] = useState(new Audio('/wheel.mp3'));
 
   const checkWheelState = async () => {
     if (!sdk) return null
@@ -187,6 +188,13 @@ function App() {
       return false
     }
   }
+
+  useEffect(() => {
+    return () => {
+      wheelSound.pause();
+      wheelSound.currentTime = 0;
+    };
+  }, [wheelSound]);
   
 
   // Initialize Arch SDK with proper provider
@@ -266,6 +274,10 @@ function App() {
     if (!sdk || !walletAddress || !publicKey || wheelState.isSpinning) return
   
     try {
+      wheelSound.currentTime = 0; // Reset the audio to start
+      wheelSound.loop = true; // Make it loop while spinning
+      wheelSound.play().catch(e => console.log('Audio play failed:', e));
+
       setWheelState(prev => ({ ...prev, isSpinning: true }))
       
       // Generate user secret and commitment
@@ -351,14 +363,17 @@ function App() {
         currentPrize: wheelData[prizeNumber].option
       }))
 
-      // The wheel will automatically stop after the animation
       setTimeout(() => {
-        setWheelState(prev => ({ ...prev, isSpinning: false }))
-      }, 10000) // Animation takes 10 seconds
+        setWheelState(prev => ({ ...prev, isSpinning: false }));
+        wheelSound.pause(); // Stop the sound when wheel stops
+        wheelSound.currentTime = 0;
+      }, 10000)
 
     } catch (err) {
       console.error('Failed to spin wheel:', err)
       setWheelState(prev => ({ ...prev, isSpinning: false }))
+      wheelSound.pause();
+      wheelSound.currentTime = 0;
     }
   }
 
