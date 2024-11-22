@@ -373,11 +373,17 @@ function App() {
       ) : !isInitialized ? (
         <div>
           <p>Wheel needs to be initialized</p>
-          <button onClick={initializeWheel}>Initialize Wheel</button>
+          {isAdmin && (
+            <button onClick={initializeWheel}>Initialize Wheel</button>
+          )}
+          {!isAdmin && (
+            <p>Please wait for an admin to initialize the wheel.</p>
+          )}
         </div>
       ) : (
         <div className="game-container">
           <p>Connected: {walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}</p>
+          {isAdmin && <p className="admin-badge">Admin</p>}
           
           <div className="wheel-wrapper">
             <Wheel
